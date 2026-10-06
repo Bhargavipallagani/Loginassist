@@ -5,7 +5,7 @@ from markupsafe import escape
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = "change-this-secret"
+app.secret_key = "j@a&g*a!n#$%gjhfds"
 DB = "app.db"
 LOCK_AFTER = 5       # failed attempts in a row
 LOCK_SECONDS = 60    # how long the account stays locked
