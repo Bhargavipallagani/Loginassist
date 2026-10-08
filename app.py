@@ -1,16 +1,27 @@
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, request, redirect, session
 from markupsafe import escape
 from werkzeug.security import generate_password_hash, check_password_hash
 
+try:   # load the trained ML model (made by ml/train_model.py)
+    import joblib
+    import pandas as pd
+    MODEL = joblib.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "risk_model.joblib"))
+except Exception:
+    MODEL = None   # no model file found: the app falls back to the fixed rules
+FEATURES = ["failed_30min", "avg_gap_sec", "hour", "new_device", "locked"]
+
 app = Flask(__name__)
-app.secret_key = "j@a&g*a!n#$%gjhfds"
+app.secret_key = os.environ.get("SECRET_KEY", "dev-only-secret-change-me")
 DB = "app.db"
 LOCK_AFTER = 5       # failed attempts in a row
 LOCK_SECONDS = 60    # how long the account stays locked
 RISK_WINDOW_MIN = 30  # risk looks at attempts from the last 30 minutes
-ADMIN_EMAIL = "admin@test.com"   # only this account can open /admin
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@test.com")   # only this account can open /admin
+
+GENERIC_FAIL = "Email or password is incorrect. Check the spelling and Caps Lock, then try again."
 
 COUNTDOWN = ("<script>var s=document.getElementById('t'),n=parseInt(s.textContent);"
              "var i=setInterval(function(){n--;if(n<=0){clearInterval(i);"
@@ -126,23 +137,37 @@ def locked_seconds_left(email):
     return int(left) + 1 if left > 0 else 0
 
 
-def risk_for(email):
-    """Return (level, reasons) from the recent attempts of this email."""
+def ml_features(email):
+    """Turn the last 30 minutes of attempts into the numbers the model expects."""
     since = (datetime.now() - timedelta(minutes=RISK_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
     c = db()
-    rows = c.execute("SELECT ok,reason FROM attempts WHERE email=? AND time>=?",
-                     (email, since)).fetchall()
+    rows = c.execute("SELECT ok,reason,time,device FROM attempts WHERE email=? AND time>=? "
+                     "ORDER BY id", (email, since)).fetchall()
+    old = c.execute("SELECT DISTINCT device FROM attempts WHERE email=? AND time<?",
+                    (email, since)).fetchall()
     c.close()
     fails = sum(1 for r in rows if not r["ok"])
-    locked = any(r["reason"] == "Account locked" for r in rows)
-    if locked or fails >= 5:
-        level = "High"
-    elif fails >= 3:
-        level = "Medium"
-    else:
-        level = "Low"
+    locked = int(fails >= 5 or any(r["reason"] == "Account locked" for r in rows))
+    times = [datetime.strptime(r["time"], "%Y-%m-%d %H:%M:%S") for r in rows]
+    gaps = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
+    avg_gap = sum(gaps) / len(gaps) if gaps else 60.0   # one attempt: assume a normal pace
+    seen = {r["device"] for r in old}
+    new_device = int(bool(seen) and bool(rows) and rows[-1]["device"] not in seen)
+    return [fails, avg_gap, datetime.now().hour, new_device, locked], fails, locked
+
+
+def risk_for(email):
+    """Return (level, reasons). Uses the ML model, or fixed rules if there is no model."""
+    feats, fails, locked = ml_features(email)
     reasons = [f"{fails} failed attempt(s) in the last {RISK_WINDOW_MIN} minutes"]
+    if MODEL is not None:
+        p = float(MODEL.predict_proba(pd.DataFrame([feats], columns=FEATURES))[0][1])
+        level = "High" if p >= 0.65 else "Medium" if p >= 0.35 else "Low"
+        reasons.append(f"ML model risk score: {round(p * 100)}%")
+    else:
+        level = "High" if (locked or fails >= 5) else "Medium" if fails >= 3 else "Low"
     if locked:
+        level = "High"   # a lockout is always High
         reasons.append("The account was locked")
     return level, reasons
 
@@ -230,17 +255,17 @@ def login():
         c = db()
         user = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
         c.close()
-        left = locked_seconds_left(email) if user else 0
-        if not user:
-            log(email, False, "Email not found")
-            msg = "No account with this email. Check spelling or sign up."
-        elif left:
+        left = locked_seconds_left(email)
+        if left:
             log(email, False, "Account locked")
             msg = f"Account locked: too many failed attempts. Try again in <span id='t'>{left}</span> seconds."
             extra = COUNTDOWN
+        elif not user:
+            log(email, False, "Email not found")
+            msg = GENERIC_FAIL
         elif not check_password_hash(user["pw"], request.form["pw"]):
             log(email, False, "Wrong password")
-            msg = "Wrong password. Check Caps Lock and try again."
+            msg = GENERIC_FAIL
         else:
             log(email, True, "")
             session["email"] = email
@@ -280,18 +305,27 @@ def logs():
     return page("My login attempts", "", body)
 
 
-@app.route("/help", methods=["GET", "POST"])
+HELP_TIPS = [
+    "Check that Caps Lock is off and the keyboard language is correct.",
+    "Use the exact email you signed up with, with no extra spaces.",
+    "After 5 wrong passwords the account locks for 60 seconds. Wait for the timer, then try again.",
+    "Type your password in Notepad first, then copy it into the box.",
+    "If nothing works, ask the admin for help.",
+]
+
+
+@app.route("/help")
 def help_page():
-    email = session.get("email", "")
-    result = ""
-    if request.method == "POST":
-        email = request.form["email"].strip().lower()
+    email = session.get("email")
+    if email:
         headline, steps = diagnose(email)
         items = "".join(f"<li>{escape(s)}</li>" for s in steps)
-        result = f"<h3>{escape(headline)}</h3><p class='muted'>What to do:</p><ol>{items}</ol>"
-    form_html = (f'<form method=post class="inline"><input name=email placeholder="Your email" '
-                 f'value="{escape(email)}" required><button>Diagnose my problem</button></form>')
-    return page("Why can't I log in?", "", form_html + result)
+        body = f"<h3>{escape(headline)}</h3><p class='muted'>What to do:</p><ol>{items}</ol>"
+    else:
+        items = "".join(f"<li>{escape(t)}</li>" for t in HELP_TIPS)
+        body = (f"<p>Can't log in? These are the most common reasons and fixes:</p><ol>{items}</ol>"
+                "<p class='muted'>Log in to see a personal diagnosis of your own recent attempts.</p>")
+    return page("Why can't I log in?", "", body)
 
 
 @app.route("/admin")
@@ -334,6 +368,9 @@ def admin():
 def logout():
     session.clear()
     return redirect("/")
+
+
+init()   # create the tables whenever the app starts
 
 
 if __name__ == "__main__":
