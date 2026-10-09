@@ -28,6 +28,14 @@ LOCK_SECONDS = 60    # how long the account stays locked
 RISK_WINDOW_MIN = 30  # risk looks at attempts from the last 30 minutes
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@test.com")   # only this account can open /admin
 
+TZ_OFFSET_MIN = int(os.environ.get("TZ_OFFSET_MIN", "330"))   # 330 = India time (UTC+5:30); Render servers use UTC
+
+
+def local_hour():
+    """Hour of the day in the users' time zone (the ML model learned from local hours)."""
+    return (datetime.utcnow() + timedelta(minutes=TZ_OFFSET_MIN)).hour
+
+
 GENERIC_FAIL = "Email or password is incorrect. Check the spelling and Caps Lock, then try again."
 
 COUNTDOWN = ("<script>var s=document.getElementById('t'),n=parseInt(s.textContent);"
@@ -180,7 +188,7 @@ def ml_features(email):
     avg_gap = sum(gaps) / len(gaps) if gaps else 60.0   # one attempt: assume a normal pace
     seen = {r["device"] for r in old}
     new_device = int(bool(seen) and bool(rows) and rows[-1]["device"] not in seen)
-    return [fails, avg_gap, datetime.now().hour, new_device, locked], fails, locked
+    return [fails, avg_gap, local_hour(), new_device, locked], fails, locked
 
 
 def risk_for(email):
