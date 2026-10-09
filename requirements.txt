@@ -1,2 +1,8 @@
-flask
-gunicorn
+   Flask
+   gunicorn
+   psycopg[binary]
+   werkzeug
+   scikit-learn
+   pandas
+   numpy
+   joblib
