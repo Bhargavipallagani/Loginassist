@@ -16,6 +16,13 @@ FEATURES = ["failed_30min", "avg_gap_sec", "hour", "new_device", "locked"]
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-secret-change-me")
 DB = "app.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")   # set on Render -> permanent Postgres (Neon)
+if DATABASE_URL:
+    import psycopg
+    from psycopg.rows import dict_row
+    DB_ERRORS = (psycopg.errors.UniqueViolation,)
+else:
+    DB_ERRORS = (sqlite3.IntegrityError,)
 LOCK_AFTER = 5       # failed attempts in a row
 LOCK_SECONDS = 60    # how long the account stays locked
 RISK_WINDOW_MIN = 30  # risk looks at attempts from the last 30 minutes
@@ -98,17 +105,37 @@ def page(title, msg, body, ok=False):
             f"<main><div class='card'><h1>{title}</h1>{note}{body}</div></main></body></html>")
 
 
+class Conn:
+    """Same simple calls for both databases: SQLite on your laptop, Postgres on Render."""
+    def __init__(self):
+        if DATABASE_URL:
+            self.c = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        else:
+            self.c = sqlite3.connect(DB)
+            self.c.row_factory = sqlite3.Row
+
+    def execute(self, sql, params=()):
+        if DATABASE_URL:
+            sql = sql.replace("?", "%s")
+        return self.c.execute(sql, params)
+
+    def commit(self):
+        self.c.commit()
+
+    def close(self):
+        self.c.close()
+
+
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+    return Conn()
 
 
 def init():
     c = db()
     c.execute("CREATE TABLE IF NOT EXISTS users(email TEXT PRIMARY KEY, pw TEXT)")
-    c.execute("""CREATE TABLE IF NOT EXISTS attempts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, time TEXT,
+    pk = "SERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    c.execute(f"""CREATE TABLE IF NOT EXISTS attempts(
+        id {pk}, email TEXT, time TEXT,
         ok INTEGER, reason TEXT, device TEXT)""")
     c.commit()
     c.close()
@@ -230,15 +257,16 @@ def signup():
     msg = ""
     if request.method == "POST":
         email = request.form["email"].strip().lower()
+        c = db()
         try:
-            c = db()
             c.execute("INSERT INTO users VALUES(?,?)",
                       (email, generate_password_hash(request.form["pw"])))
             c.commit()
-            c.close()
             return redirect("/?created=1")
-        except sqlite3.IntegrityError:
+        except DB_ERRORS:
             msg = "This email is already registered. Try logging in."
+        finally:
+            c.close()
     hint = "<p class='muted hint'>Already have an account? <a href='/'>Log in</a></p>"
     return page("Create your account", msg, form("Create account") + hint)
 
